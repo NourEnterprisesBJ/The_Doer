@@ -18,7 +18,10 @@
     <application
         android:label="The Doer"
         android:allowBackup="false"
-        android:theme="@style/Theme.TheDoer">
+        android:theme="@style/Theme.TheDoer"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        ...>
 
         <!-- Vrai point d'entrée : explique et demande chaque permission
              avant que l'assistant ne soit utilisable. -->
