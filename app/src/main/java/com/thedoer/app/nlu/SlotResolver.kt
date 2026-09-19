@@ -1,29 +1,30 @@
 package com.thedoer.app.nlu
 
+import android.content.Context
 import com.thedoer.app.core.models.Intent
-import com.thedoer.app.core.models.Slot
 
 /**
  * Prend un Intent avec des slots bruts (ex: target="maman",
- * time="16h30") et tente de les résoudre en valeurs exploitables
- * (ex: target -> numéro de téléphone réel, time -> timestamp absolu).
+ * time="16h30") et les résout en valeurs exploitables : target ->
+ * numéro de téléphone réel via ContactResolver, time -> timestamp
+ * absolu via DateTimeParser.
  *
- * Sprint 1 : implémentation minimale qui marque juste les slots
- * comme résolus/non résolus sans vraie résolution métier.
- * Sprint 2/5 : vraie résolution contacts (ContactsContract) et
- * dates relatives.
+ * Sprint 2 : résolution réelle branchée (fini les stubs qui
+ * renvoyaient la valeur brute telle quelle).
  */
-class SlotResolver {
+class SlotResolver(context: Context) {
 
-    fun resolve(intent: Intent): Intent {
+    private val contactResolver = ContactResolver(context)
+    private val dateTimeParser = DateTimeParser()
+
+    suspend fun resolve(intent: Intent): Intent {
         for ((name, slot) in intent.slots) {
             when (name) {
                 "target" -> resolveContact(slot)
                 "time" -> resolveTime(slot)
                 else -> {
                     // Slots génériques (ex: "content", "message") :
-                    // pas de résolution nécessaire, on les considère
-                    // valides tels quels.
+                    // pas de résolution nécessaire, valides tels quels.
                     slot.resolved = true
                     slot.resolvedValue = slot.value
                 }
@@ -32,34 +33,42 @@ class SlotResolver {
         return intent
     }
 
-    /**
-     * TODO (Sprint 5) : chercher dans une table Room de surnoms
-     * ("maman" -> contact_id) puis fallback sur ContactsContract
-     * pour trouver le numéro réel. Pour l'instant, on considère le
-     * slot non résolu si vide, résolu tel quel sinon (le nom brut
-     * sera utilisé comme recherche approximative par ActionExecutor).
-     */
-    private fun resolveContact(slot: Slot) {
+    private suspend fun resolveContact(slot: com.thedoer.app.core.models.Slot) {
         if (slot.value.isBlank()) {
             slot.resolved = false
             return
         }
+
+        val match = contactResolver.resolve(slot.value)
+        if (match == null) {
+            // Pas trouvé, ou ambigu (plusieurs candidats) : on ne
+            // devine pas. ActionExecutor verra resolved=false et
+            // répondra qu'il ne connaît pas ce contact.
+            slot.resolved = false
+            return
+        }
+
         slot.resolved = true
-        slot.resolvedValue = slot.value
+        slot.resolvedValue = match.phoneNumber
     }
 
-    /**
-     * TODO (Sprint 2) : vraie interprétation des expressions
-     * relatives ("dans une heure", "demain matin", "ce soir") en
-     * timestamp absolu. Pour l'instant, on ne résout que le format
-     * explicite déjà extrait par IntentClassifier (ex: "16h30").
-     */
-    private fun resolveTime(slot: Slot) {
+    private fun resolveTime(slot: com.thedoer.app.core.models.Slot) {
         if (slot.value.isBlank()) {
             slot.resolved = false
             return
         }
+
+        val parsed = dateTimeParser.parse(slot.value)
+        if (parsed == null) {
+            slot.resolved = false
+            return
+        }
+
         slot.resolved = true
-        slot.resolvedValue = slot.value
+        // On garde le format "16h30" pour ActionExecutor (AlarmClock
+        // attend heure/minute, pas un timestamp), mais on pourrait
+        // aussi exposer parsed.timestampMillis si un futur intent
+        // en a besoin (ex: SET_REMINDER en Sprint 3).
+        slot.resolvedValue = parsed.displayText
     }
 }
