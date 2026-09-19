@@ -57,7 +57,7 @@ class VoiceForegroundService : Service() {
         sttEngine = SttEngineFactory.create(this, resourceManager)
         ttsEngine = TtsEngineFactory.create(this, resourceManager)
         intentClassifier = IntentClassifier()
-        slotResolver = SlotResolver()
+        slotResolver = SlotResolver(this)
         actionExecutor = ActionExecutor(this)
 
         scope.launch {
