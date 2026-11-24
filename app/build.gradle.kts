@@ -13,7 +13,17 @@ android {
         minSdk = 24
         targetSdk = 34
         versionCode = 1
-        versionName = "0.2.0-sprint2"
+        versionName = "0.2.5-sprint2.5"
+
+        // Architectures conservées dans l'APK :
+        //  - arm64-v8a   : téléphones récents (64 bits)
+        //  - armeabi-v7a : téléphones d'entrée de gamme (32 bits), cœur
+        //                  de cible du projet
+        // x86 / x86_64 retirées : émulateurs uniquement, aucun intérêt
+        // pour un APK distribué à de vrais utilisateurs.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -43,7 +53,7 @@ dependencies {
     implementation("com.alphacephei:vosk-android:0.3.47")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
-    // Persistance locale : Room (Sprint 2 - surnoms de contacts, mémoire)
+    // Persistance locale : Room (surnoms de contacts, mode absence, urgences)
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
