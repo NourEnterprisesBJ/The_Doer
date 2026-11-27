@@ -1,5 +1,6 @@
 package com.thedoer.app.execution
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent as AndroidIntent
 import android.net.Uri
@@ -9,143 +10,174 @@ import com.thedoer.app.core.eventbus.AppEvent
 import com.thedoer.app.core.eventbus.EventBus
 import com.thedoer.app.core.models.Intent
 import com.thedoer.app.core.models.IntentType
+import com.thedoer.app.core.models.Slot
+import com.thedoer.app.nlu.DateTimeParser
+import com.thedoer.app.nlu.SlotResolver
 import com.thedoer.app.permissions.PermissionManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Dernière étape du pipeline : transforme un Intent résolu en action
- * système réelle (appel, SMS, alarme, calendrier...). Publie
- * ActionExecuted + SpeakRequest sur l'EventBus dans tous les cas,
- * succès ou échec, pour que l'utilisateur ait toujours un retour vocal.
+ * Dernière étape du pipeline : transforme une intention résolue en action
+ * système réelle (appel, SMS, alarme, calendrier, heure).
+ *
+ * Contrat : execute() publie TOUJOURS un résultat sur l'EventBus (succès ou
+ * échec) accompagné d'une phrase à dire. La phrase décrit uniquement ce qui
+ * s'est réellement passé : « J'ouvre l'écran de message » et non
+ * « Message envoyé » quand l'utilisateur doit encore appuyer sur Envoyer.
+ *
+ * Limite connue (Android 10+) : lancer un écran (appel, alarme, SMS,
+ * calendrier) depuis l'arrière-plan est restreint par le système. Ces
+ * actions fonctionnent quand l'application est visible à l'écran. Un
+ * fonctionnement mains libres écran éteint demandera d'autres mécanismes
+ * (TelecomManager pour l'appel, SmsManager pour le SMS, AlarmManager pour
+ * l'alarme) : chantier prévu après les premiers tests.
  */
 class ActionExecutor(private val context: Context) {
 
+    /** Issue d'une action : succès ou échec, et phrase à prononcer. */
+    private data class Outcome(val success: Boolean, val message: String)
+
     suspend fun execute(intent: Intent) {
-        if (!PermissionManager.hasAllPermissions(context, intent.intentType)) {
-            val message = "Il me manque une permission pour faire ça."
-            publishResult(intent, success = false, message = message)
-            return
-        }
-
-        try {
-            when (intent.intentType) {
-                IntentType.CALL_CONTACT -> executeCall(intent)
-                IntentType.SEND_SMS -> executeSms(intent)
-                IntentType.SET_ALARM -> executeSetAlarm(intent)
-                IntentType.ADD_CALENDAR_EVENT -> executeCalendarEvent(intent)
-                IntentType.GET_TIME_DATE -> executeGetTimeDate(intent)
-                IntentType.SET_REMINDER -> executeReminderStub(intent)
-                IntentType.READ_LAST_MESSAGE -> executeReadLastMessageStub(intent)
-                IntentType.READ_DOCUMENT_OCR -> executeOcrStub(intent)
-                IntentType.DESCRIBE_SCENE -> executeDescribeSceneStub(intent)
-                IntentType.EMERGENCY_TRIGGER -> executeEmergencyStub(intent)
-                IntentType.UNKNOWN -> publishResult(
-                    intent, success = false,
-                    message = "Je n'ai pas compris cette demande."
-                )
-            }
+        val outcome = try {
+            perform(intent)
+        } catch (e: ActivityNotFoundException) {
+            Outcome(false, "Aucune application du téléphone ne peut faire cela.")
+        } catch (e: SecurityException) {
+            EventBus.publish(AppEvent.ErrorOccurred(SOURCE, detailOf(e)))
+            Outcome(false, "Android a refusé cette action. Vérifie les autorisations de l'application.")
         } catch (e: Exception) {
-            publishResult(intent, success = false, message = "Une erreur est survenue : ${e.message}")
+            EventBus.publish(AppEvent.ErrorOccurred(SOURCE, detailOf(e)))
+            Outcome(false, "Une erreur est survenue.")
+        }
+
+        EventBus.publish(AppEvent.ActionExecuted(intent, outcome.success, outcome.message))
+        EventBus.publish(AppEvent.SpeakRequest(outcome.message))
+    }
+
+    // ---------------------------------------------------------------
+    // Aiguillage
+    // ---------------------------------------------------------------
+
+    private fun perform(intent: Intent): Outcome {
+        if (!PermissionManager.hasAllPermissions(context, intent.intentType)) {
+            return Outcome(
+                false,
+                "Il me manque une autorisation pour faire cela. Active-la dans les réglages de l'application."
+            )
+        }
+
+        return when (intent.intentType) {
+            IntentType.CALL_CONTACT -> call(intent)
+            IntentType.SEND_SMS -> composeSms(intent)
+            IntentType.SET_ALARM -> setAlarm(intent)
+            IntentType.ADD_CALENDAR_EVENT -> openCalendarEditor(intent)
+            IntentType.GET_TIME_DATE -> tellTimeAndDate()
+
+            IntentType.UNKNOWN -> Outcome(false, "Je n'ai pas compris cette demande.")
+
+            // Pas encore branchées : on le dit franchement plutôt que d'échouer en silence.
+            IntentType.SET_REMINDER -> Outcome(false, "Les rappels ne sont pas encore disponibles.")
+            IntentType.READ_LAST_MESSAGE -> Outcome(false, "La lecture des messages n'est pas encore disponible.")
+            IntentType.READ_DOCUMENT_OCR -> Outcome(false, "La lecture de documents n'est pas encore disponible.")
+            IntentType.DESCRIBE_SCENE -> Outcome(false, "La description de ce qui m'entoure n'est pas encore disponible.")
+            IntentType.EMERGENCY_TRIGGER -> Outcome(
+                false,
+                "Le mode urgence n'est pas encore disponible. Compose toi-même le numéro des secours."
+            )
+
+            else -> Outcome(false, "Cette fonction n'est pas encore disponible.")
         }
     }
 
-    private suspend fun executeCall(intent: Intent) {
-        val target = intent.slots["target"]?.resolvedValue
-        if (target.isNullOrBlank()) {
-            publishResult(intent, success = false, message = "Je ne sais pas qui appeler.")
-            return
+    // ---------------------------------------------------------------
+    // Actions
+    // ---------------------------------------------------------------
+
+    private fun call(intent: Intent): Outcome {
+        val target = intent.slots[SlotResolver.SLOT_TARGET]
+        val number = resolvedNumber(target) ?: return contactFailure(target, "appeler")
+
+        launch(AndroidIntent(AndroidIntent.ACTION_CALL, Uri.fromParts("tel", number, null)))
+        return Outcome(true, "J'appelle ${target?.value}.")
+    }
+
+    private fun composeSms(intent: Intent): Outcome {
+        val target = intent.slots[SlotResolver.SLOT_TARGET]
+        val number = resolvedNumber(target) ?: return contactFailure(target, "contacter")
+        val body = intent.slots[SLOT_MESSAGE]?.resolvedValue.orEmpty()
+
+        val action = AndroidIntent(AndroidIntent.ACTION_SENDTO, Uri.fromParts("smsto", number, null))
+            .putExtra("sms_body", body)
+        launch(action)
+
+        // Le message n'est PAS envoyé : l'écran de rédaction s'ouvre, l'envoi reste manuel.
+        return Outcome(true, "J'ouvre l'écran de message pour ${target?.value}.")
+    }
+
+    private fun setAlarm(intent: Intent): Outcome {
+        val timestamp = SlotResolver.resolvedTimestamp(intent.slots[SlotResolver.SLOT_TIME])
+            ?: return Outcome(false, "Je n'ai pas compris l'heure de l'alarme.")
+        val (hour, minute) = DateTimeParser.hourAndMinuteOf(timestamp)
+
+        val action = AndroidIntent(AlarmClock.ACTION_SET_ALARM)
+            .putExtra(AlarmClock.EXTRA_HOUR, hour)
+            .putExtra(AlarmClock.EXTRA_MINUTES, minute)
+            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        launch(action)
+
+        return Outcome(true, "Alarme réglée ${DateTimeParser.describe(timestamp)}.")
+    }
+
+    private fun openCalendarEditor(intent: Intent): Outcome {
+        val title = intent.slots[SLOT_TITLE]?.resolvedValue ?: intent.rawText
+
+        val action = AndroidIntent(AndroidIntent.ACTION_INSERT)
+            .setData(CalendarContract.Events.CONTENT_URI)
+            .putExtra(CalendarContract.Events.TITLE, title)
+        SlotResolver.resolvedTimestamp(intent.slots[SlotResolver.SLOT_TIME])?.let { begin ->
+            action.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, begin)
         }
-        val androidIntent = AndroidIntent(AndroidIntent.ACTION_CALL, Uri.parse("tel:$target")).apply {
-            addFlags(AndroidIntent.FLAG_ACTIVITY_NEW_TASK)
+        launch(action)
+
+        // L'événement n'est PAS encore enregistré : l'éditeur s'ouvre, l'enregistrement reste manuel.
+        return Outcome(true, "J'ouvre le calendrier pour ajouter l'événement.")
+    }
+
+    private fun tellTimeAndDate(): Outcome {
+        val now = Date()
+        val time = SimpleDateFormat("H'h'mm", Locale.FRENCH).format(now)
+        val date = SimpleDateFormat("EEEE d MMMM yyyy", Locale.FRENCH).format(now)
+        return Outcome(true, "Il est $time, nous sommes le $date.")
+    }
+
+    // ---------------------------------------------------------------
+    // Utilitaires
+    // ---------------------------------------------------------------
+
+    private fun launch(action: AndroidIntent) {
+        action.addFlags(AndroidIntent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(action)
+    }
+
+    private fun resolvedNumber(target: Slot?): String? =
+        target?.takeIf { it.resolved }?.resolvedValue?.takeIf { it.isNotBlank() }
+
+    /** Distingue « rien compris » de « contact introuvable ou ambigu ». */
+    private fun contactFailure(target: Slot?, verb: String): Outcome =
+        if (target == null || target.value.isBlank()) {
+            Outcome(false, "Je n'ai pas compris qui $verb.")
+        } else {
+            Outcome(false, "Je n'ai pas trouvé un contact unique nommé ${target.value}.")
         }
-        context.startActivity(androidIntent)
-        publishResult(intent, success = true, message = "J'appelle $target.")
-    }
 
-    private suspend fun executeSms(intent: Intent) {
-        val target = intent.slots["target"]?.resolvedValue
-        val message = intent.slots["message"]?.resolvedValue ?: ""
-        if (target.isNullOrBlank()) {
-            publishResult(intent, success = false, message = "Je ne sais pas à qui envoyer le message.")
-            return
-        }
-        val androidIntent = AndroidIntent(AndroidIntent.ACTION_SENDTO, Uri.parse("smsto:$target")).apply {
-            putExtra("sms_body", message)
-            addFlags(AndroidIntent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(androidIntent)
-        publishResult(intent, success = true, message = "Message envoyé à $target.")
-    }
+    private fun detailOf(error: Throwable): String =
+        error.message ?: error.javaClass.simpleName
 
-    private suspend fun executeSetAlarm(intent: Intent) {
-        val time = intent.slots["time"]?.resolvedValue
-        val (hour, minute) = parseHourMinute(time) ?: run {
-            publishResult(intent, success = false, message = "Je n'ai pas compris l'heure de l'alarme.")
-            return
-        }
-        val androidIntent = AndroidIntent(AlarmClock.ACTION_SET_ALARM).apply {
-            putExtra(AlarmClock.EXTRA_HOUR, hour)
-            putExtra(AlarmClock.EXTRA_MINUTES, minute)
-            putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-            addFlags(AndroidIntent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(androidIntent)
-        publishResult(intent, success = true, message = "Alarme réglée à ${hour}h${minute.toString().padStart(2, '0')}.")
-    }
-
-    private suspend fun executeCalendarEvent(intent: Intent) {
-        val title = intent.slots["title"]?.resolvedValue ?: intent.rawText
-        val androidIntent = AndroidIntent(AndroidIntent.ACTION_INSERT).apply {
-            data = CalendarContract.Events.CONTENT_URI
-            putExtra(CalendarContract.Events.TITLE, title)
-            addFlags(AndroidIntent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(androidIntent)
-        publishResult(intent, success = true, message = "Événement ajouté au calendrier.")
-    }
-
-    private suspend fun executeGetTimeDate(intent: Intent) {
-        val now = java.util.Calendar.getInstance()
-        val hour = now.get(java.util.Calendar.HOUR_OF_DAY)
-        val minute = now.get(java.util.Calendar.MINUTE)
-        publishResult(
-            intent, success = true,
-            message = "Il est ${hour}h${minute.toString().padStart(2, '0')}."
-        )
-    }
-
-    private fun parseHourMinute(time: String?): Pair<Int, Int>? {
-        if (time.isNullOrBlank()) return null
-        val regex = Regex("""(\d{1,2})\s*[h:]\s*(\d{0,2})""")
-        val match = regex.find(time) ?: return null
-        val hour = match.groupValues[1].toIntOrNull() ?: return null
-        val minute = match.groupValues[2].toIntOrNull() ?: 0
-        return hour to minute
-    }
-
-    // --- Stubs Sprint 3/4/5 : intentions pas encore câblées ---
-
-    private suspend fun executeReminderStub(intent: Intent) {
-        publishResult(intent, success = false, message = "Les rappels seront disponibles bientôt.")
-    }
-
-    private suspend fun executeReadLastMessageStub(intent: Intent) {
-        publishResult(intent, success = false, message = "La lecture des messages sera disponible bientôt.")
-    }
-
-    private suspend fun executeOcrStub(intent: Intent) {
-        publishResult(intent, success = false, message = "La lecture de documents sera disponible bientôt.")
-    }
-
-    private suspend fun executeDescribeSceneStub(intent: Intent) {
-        publishResult(intent, success = false, message = "La description de scène sera disponible bientôt.")
-    }
-
-    private suspend fun executeEmergencyStub(intent: Intent) {
-        publishResult(intent, success = false, message = "Le mode urgence sera disponible bientôt.")
-    }
-
-    private suspend fun publishResult(intent: Intent, success: Boolean, message: String) {
-        EventBus.publish(AppEvent.ActionExecuted(intent, success, message))
-        EventBus.publish(AppEvent.SpeakRequest(message))
+    private companion object {
+        const val SOURCE = "ActionExecutor"
+        const val SLOT_MESSAGE = "message"
+        const val SLOT_TITLE = "title"
     }
 }
