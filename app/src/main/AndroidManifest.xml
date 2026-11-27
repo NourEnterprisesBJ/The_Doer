@@ -15,6 +15,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Permission « normale » : accordée automatiquement à l'installation.
+         Sans elle, régler une alarme dans l'appli Horloge échoue. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
     <!-- Android 11+ : sans cette déclaration, l'application ne peut pas
          découvrir le moteur de synthèse vocale installé sur l'appareil
          et TextToSpeech échoue à l'initialisation. -->
